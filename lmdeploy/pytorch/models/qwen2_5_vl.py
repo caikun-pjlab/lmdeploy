@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from packaging import version
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
@@ -406,6 +407,26 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphM
                                             bias=False,
                                             dtype=dtype,
                                             device=device)
+        self.compile_vit = False
+
+    def compile_model(self):
+        torch_version = version.parse(torch.__version__)
+        if torch_version < version.parse('2.5.0'):
+            return
+
+        self.visual = torch.compile(self.visual, mode='max-autotune-no-cudagraphs', fullgraph=True)
+        self.compile_vit = True
+        self.has_compiled_vit = False
+
+    def _mark_dynamic_once(self, tensor_list, dims_list):
+        """call torch._dynamo.mark_dynamic to avoid recompile."""
+        if not self.compile_vit or self.has_compiled_vit:
+            return
+
+        for tensor, dims in zip(tensor_list, dims_list):
+            if tensor is not None:
+                torch._dynamo.mark_dynamic(tensor, dims)
+        self.has_compiled_vit = True
 
     def forward(
         self,
@@ -429,9 +450,11 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, DeployModelMixin, CudaGraphM
             if pixel_values is not None:
                 dtype = inputs_embeds.dtype
                 pixel_values = pixel_values.to(dtype)
+                vis_pos_emb = vis_pos_emb.to(dtype)
+                self._mark_dynamic_once([pixel_values, vis_pos_emb, window_index, cu_window_seqlens], [0, 0, 0, 0])
                 image_embeds = self.visual(pixel_values,
                                            cu_seqlens=vis_cu_seqlens,
-                                           rotary_pos_emb=vis_pos_emb.to(dtype),
+                                           rotary_pos_emb=vis_pos_emb,
                                            window_index=window_index,
                                            cu_window_seqlens=cu_window_seqlens)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask[..., None], image_embeds)

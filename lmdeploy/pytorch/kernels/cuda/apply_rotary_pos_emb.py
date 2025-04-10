@@ -4,9 +4,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from .triton_utils import get_kernel_meta
 
-
+@triton.heuristics(values={'num_warps': lambda _: 4, 'num_stages': lambda _: 1})
 @triton.jit(do_not_specialize=('seq_len', ))
 def apply_rotary_pos_emb_qk_kernel(
     Q,
@@ -130,14 +129,11 @@ def apply_rotary_pos_emb(q: Tensor,
     BLOCK_N = triton.next_power_of_2(half_size)
     num_heads_q = q.size(-2)
     num_heads_k = k.size(-2)
-    num_warps = 4
-    num_stages = 1
 
-    kernel_meta = get_kernel_meta(q)
-    grid = [
+    grid = (
         num_heads_q + num_heads_k,
         triton.cdiv(seq_len, BLOCK),
-    ]
+    )
     apply_rotary_pos_emb_qk_kernel[grid](q,
                                          k,
                                          cos,
@@ -160,9 +156,6 @@ def apply_rotary_pos_emb(q: Tensor,
                                          half_size=half_size,
                                          BLOCK=BLOCK,
                                          BLOCK_QH=num_heads_q,
-                                         BLOCK_N=BLOCK_N,
-                                         num_warps=num_warps,
-                                         num_stages=num_stages,
-                                         **kernel_meta)
+                                         BLOCK_N=BLOCK_N)
 
     return q_embed, k_embed

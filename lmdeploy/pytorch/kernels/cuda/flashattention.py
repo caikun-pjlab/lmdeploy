@@ -1,5 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import math
+from typing import Optional
 
 import torch
 import triton
@@ -8,6 +8,8 @@ from packaging import version
 from torch import Tensor
 
 from lmdeploy.utils import get_logger
+
+from .utils import get_condition_custom_op_decorator
 
 logger = get_logger('lmdeploy')
 
@@ -72,10 +74,11 @@ def _prefill_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, q1, k1_ptrs, loop_start
             k1 = _load_kv(k1_ptrs, boundary_check=k_bound)
             qk += tl.dot(q1, k1)
 
+        MATH_E = 2.718281828459045
         if causal_mask:
             qk *= sm_scale
             qk = softcapping(qk, logit_softcapping)
-            qk = qk * tl_log2(math.e)
+            qk = qk * tl_log2(MATH_E)
             qk_mask = (history_mask[:, None]) >= (start_n + offs_n[None, :])
             if window_size > 0:
                 qk_mask = qk_mask and ((start_n + offs_n[None, :]) >= kv_min_loc[:, None])
@@ -89,7 +92,7 @@ def _prefill_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, q1, k1_ptrs, loop_start
         elif window_size > 0:
             qk *= sm_scale
             qk = softcapping(qk, logit_softcapping)
-            qk = qk * tl_log2(math.e)
+            qk = qk * tl_log2(MATH_E)
             qk_mask = ((start_n + offs_n[None, :]) >= kv_min_loc[:, None])
             qk = tl.where(
                 qk_mask,
@@ -101,11 +104,11 @@ def _prefill_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, q1, k1_ptrs, loop_start
         elif logit_softcapping > 0:
             qk *= sm_scale
             qk = softcapping(qk, logit_softcapping)
-            qk = qk * tl_log2(math.e)
+            qk = qk * tl_log2(MATH_E)
             m_i_new = tl.maximum(m_i, tl.max(qk, 1))
             qk -= m_i_new[:, None]
         else:
-            qk_scale = sm_scale * tl_log2(math.e)
+            qk_scale = sm_scale * tl_log2(MATH_E)
             m_i_new = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
             qk = qk * qk_scale - m_i_new[:, None]
 
@@ -145,11 +148,17 @@ def _prefill_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, q1, k1_ptrs, loop_start
 #     for BM, BN, s, w in itertools.product([64, 128], [32, 64], [3, 4], [4])
 # ]
 
-
 # @triton.autotune(list(configs),
 #                  key=['head_dim_k', 'head_dim_v'],
 #                  warmup=10,
 #                  rep=25)
+
+
+@triton.heuristics(
+    values={
+        'num_warps': lambda _: 4,
+        'num_stages': lambda args: (2 if args['BLOCK_DK'] >= 512 else 3 if args['BLOCK_DK'] >= 256 else 4)
+    })
 @triton.jit
 def _flash_prefill_fwd_kernel(
     q_ptr,
@@ -339,7 +348,12 @@ def _flash_prefill_fwd_kernel(
 _nv_cap = None
 
 
-def flash_attention_fwd(
+# _flash_attention_fwd use tensor.data_ptr which will cause graph break.
+# Treating _flash_attention_fwd as a custom op to prevent torch.compile from tracing into the function
+# thus avoiding graph break.
+# More information refer to https://pytorch.org/tutorials/advanced/python_custom_ops.html.
+@(get_condition_custom_op_decorator())('mylib::_flash_attention_fwd', mutates_args={'o_states'})
+def _flash_attention_fwd(
     q_states: Tensor,
     k_states: Tensor,
     v_states: Tensor,
@@ -348,13 +362,13 @@ def flash_attention_fwd(
     q_seqlens: Tensor,
     kv_start_loc: Tensor,
     kv_seqlens: Tensor,
-    max_seqlen: int = None,
-    window_size: int = None,
-    sm_scale: float = None,
-    logit_softcapping: float = None,
+    max_seqlen: Optional[int] = None,
+    window_size: Optional[int] = None,
+    sm_scale: Optional[float] = None,
+    logit_softcapping: Optional[float] = None,
     causal: bool = True,
     kv_layout: str = 'hsd',
-):
+) -> None:
     """varlen flash Attention forward.
 
     Support sliding window, softcapping. Note that this kernel will not perform bound check for k,v.
@@ -405,14 +419,6 @@ def flash_attention_fwd(
     else:
         BLOCK_M = max(16, 16384 // BLOCK_DK)
     BLOCK_M = min(128, BLOCK_M)
-    num_warps = 4
-    num_stages = min(4, max(2, 1024 // BLOCK_DK))
-    if BLOCK_DK >= 512:
-        num_stages = 2
-    elif BLOCK_DK >= 256:
-        num_stages = 3
-    else:
-        num_stages = 4
     _flash_prefill_fwd_kernel[grid](
         q_states,
         k_states,
@@ -447,8 +453,25 @@ def flash_attention_fwd(
         BLOCK_DV=BLOCK_DV,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
 
+
+def flash_attention_fwd(
+    q_states: Tensor,
+    k_states: Tensor,
+    v_states: Tensor,
+    o_states: Tensor,
+    q_start_loc: Tensor,
+    q_seqlens: Tensor,
+    kv_start_loc: Tensor,
+    kv_seqlens: Tensor,
+    max_seqlen: Optional[int] = None,
+    window_size: Optional[int] = None,
+    sm_scale: Optional[float] = None,
+    logit_softcapping: Optional[float] = None,
+    causal: bool = True,
+    kv_layout: str = 'hsd',
+) -> torch.Tensor:
+    _flash_attention_fwd(q_states, k_states, v_states, o_states, q_start_loc, q_seqlens, kv_start_loc, kv_seqlens,
+                         max_seqlen, window_size, sm_scale, logit_softcapping, causal, kv_layout)
     return o_states

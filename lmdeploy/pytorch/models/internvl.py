@@ -331,7 +331,7 @@ class InternVLChatModel(nn.Module, DeployModelMixin, CudaGraphMixin):
                                                                 'inputs_embeds',
                                                                 index=0)
 
-        self.extract_feature = torch.compile(self.extract_feature, mode='max-autotune')
+        self.extract_feature = torch.compile(self.extract_feature, mode='max-autotune', fullgraph=True)
         self.compile_vit = True
         self.has_compiled_vit = False
 
