@@ -24,6 +24,14 @@ KVOperationId = int
 KVCacheValue = torch.Tensor | Sequence[torch.Tensor]
 
 
+@dataclass(frozen=True)
+class KVCachePool:
+    """One owning cache pool and the axis that indexes its entries."""
+
+    tensor: torch.Tensor
+    entry_axis: int
+
+
 class KVConnectorRole(enum.Enum):
     """Process role of a KV connector instance."""
 
@@ -231,11 +239,18 @@ class KVConnectorBase(ABC):
 
     # Worker-side methods.
 
-    def register_kv_caches(self, kv_caches: Mapping[str, KVCacheValue]) -> None:
+    def register_kv_caches(
+        self,
+        kv_caches: Mapping[str, KVCacheValue],
+        *,
+        state_cache_pools: Sequence[KVCachePool] = (),
+    ) -> None:
         """Register GPU KV-cache tensors with the external store.
 
-        This is a no-op for connectors that do not require memory registration. Implementations must not retain
-        temporary tensor views in a way that changes ownership of the underlying cache allocation.
+        ``state_cache_pools`` contains owning pools for non-paged state caches.
+        This is a no-op for connectors that do not require memory registration.
+        Implementations must not retain temporary tensor views in a way that
+        changes ownership of the underlying cache allocation.
         """
         return None
 

@@ -57,8 +57,6 @@ class MooncakeStoreScheduler:
         kv_transfer_config = cache_config.kv_transfer_config
         if kv_transfer_config is None or not kv_transfer_config.is_kv_transfer_instance:
             raise ValueError('MooncakeStoreScheduler requires an enabled kv_transfer_config')
-        if cache_config.states_shapes:
-            raise ValueError('Mooncake Store does not support linear-attention state caches')
         if cache_config.window_size > 1:
             raise ValueError('Mooncake Store does not support sliding-window KV caches')
 

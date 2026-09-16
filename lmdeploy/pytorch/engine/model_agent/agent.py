@@ -1544,7 +1544,10 @@ class BaseModelAgent:
                 kv_head_replica_num=self.model_config.num_replicate_key_value_heads,
             )
             if self.kv_connector is not None:
-                self.kv_connector.register_kv_caches(self._get_connector_kv_caches())
+                self.kv_connector.register_kv_caches(
+                    self._get_connector_kv_caches(),
+                    state_cache_pools=self.state_cache_engine.connector_state_cache_pools,
+                )
 
             if self.memdecode_agent is not None:
                 self.memdecode_agent.set_cache_config(self.cache_config)

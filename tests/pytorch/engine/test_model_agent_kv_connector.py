@@ -104,9 +104,10 @@ def test_build_cache_engine_replaces_connector_and_registers_row_mapping(monkeyp
     events = []
     target_rows = {'kv': object(), 'index': object()}
     mtp_rows = {'kv': object(), 'index': object()}
+    state_pools = (object(), )
     cache_engine = SimpleNamespace(connector_kv_caches=target_rows)
     mtp_cache_engine = SimpleNamespace(connector_kv_caches=mtp_rows)
-    state_cache_engine = object()
+    state_cache_engine = SimpleNamespace(connector_state_cache_pools=state_pools)
 
     class _OldConnector:
 
@@ -115,8 +116,8 @@ def test_build_cache_engine_replaces_connector_and_registers_row_mapping(monkeyp
 
     class _NewConnector:
 
-        def register_kv_caches(self, caches):
-            events.append(('register', caches))
+        def register_kv_caches(self, caches, *, state_cache_pools=()):
+            events.append(('register', caches, state_cache_pools))
 
         def shutdown(self):
             events.append('new-shutdown')
@@ -178,10 +179,53 @@ def test_build_cache_engine_replaces_connector_and_registers_row_mapping(monkeyp
             'index': target_rows['index'],
             'mtp.kv': mtp_rows['kv'],
             'mtp.index': mtp_rows['index'],
-        })
+        },
+        state_pools)
     assert agent.kv_connector is new_connector
     assert agent.cache_engine is cache_engine
     assert agent.state_cache_engine is state_cache_engine
+
+
+def test_build_cache_engine_registers_state_pools_with_connector(monkeypatch):
+    from lmdeploy.pytorch.engine.model_agent import agent as agent_module
+
+    events = []
+    row_mapping = {'kv': object()}
+    state_pools = (object(), )
+    cache_engine = SimpleNamespace(connector_kv_caches=row_mapping)
+    state_cache_engine = SimpleNamespace(connector_state_cache_pools=state_pools)
+
+    class _Connector:
+
+        def register_kv_caches(self, caches, *, state_cache_pools=()):
+            events.append((caches, state_cache_pools))
+
+        def shutdown(self):
+            pass
+
+    connector = _Connector()
+    agent = _bare_model_agent()
+    agent.cache_config.states_shapes = [((1, ), torch.float32)]
+    agent.kv_connector = None
+    agent.spec_agent = SimpleNamespace(
+        cache_engine=None,
+        specdecode_config=None,
+        build_cache_engine=lambda stream: None,
+    )
+
+    monkeypatch.setattr(agent_module, 'CacheEngine', lambda *args, **kwargs: cache_engine)
+    monkeypatch.setattr(agent_module, 'StateCacheEngine', lambda *args, **kwargs: state_cache_engine)
+    monkeypatch.setattr(agent_module, 'build_kv_connector', lambda *args, **kwargs: connector)
+    monkeypatch.setattr(
+        agent_module,
+        'get_dist_manager',
+        lambda: SimpleNamespace(current_context=lambda: SimpleNamespace(
+            attn_tp_group=SimpleNamespace(rank=0))),
+    )
+
+    agent.build_cache_engine()
+
+    assert events == [(row_mapping, state_pools)]
 
 
 def test_build_cache_engine_propagates_registration_error(monkeypatch):
@@ -191,7 +235,7 @@ def test_build_cache_engine_propagates_registration_error(monkeypatch):
 
     class _Connector:
 
-        def register_kv_caches(self, caches):
+        def register_kv_caches(self, caches, *, state_cache_pools=()):
             events.append('register')
             raise RuntimeError('registration failed')
 
@@ -208,7 +252,8 @@ def test_build_cache_engine_propagates_registration_error(monkeypatch):
     cache_engine = SimpleNamespace(connector_kv_caches={'kv': object()})
     dist_ctx = SimpleNamespace(attn_tp_group=SimpleNamespace(rank=3))
     monkeypatch.setattr(agent_module, 'CacheEngine', lambda *args, **kwargs: cache_engine)
-    monkeypatch.setattr(agent_module, 'StateCacheEngine', lambda *args, **kwargs: object())
+    monkeypatch.setattr(agent_module, 'StateCacheEngine',
+                        lambda *args, **kwargs: SimpleNamespace(connector_state_cache_pools=()))
     monkeypatch.setattr(agent_module, 'build_kv_connector', lambda *args, **kwargs: _Connector())
     monkeypatch.setattr(agent_module, 'get_dist_manager',
                         lambda: SimpleNamespace(current_context=lambda: dist_ctx))

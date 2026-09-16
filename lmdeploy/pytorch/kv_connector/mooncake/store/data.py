@@ -342,6 +342,17 @@ class MooncakeStoreRegistration:
 
 
 @dataclass(frozen=True)
+class MooncakeStoreStateRegistration:
+    """One owning state-cache pool registered with Mooncake Store."""
+
+    name: str
+    address: int
+    size: int
+    slot_count: int
+    slot_size: int
+
+
+@dataclass(frozen=True)
 class MooncakeStoreLoadRequest:
     """One asynchronous load from Mooncake into allocated GPU blocks."""
 

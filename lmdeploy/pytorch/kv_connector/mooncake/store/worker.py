@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
-from lmdeploy.pytorch.kv_connector.base import KVCacheValue, KVConnectorOutput, RequestId
+from lmdeploy.pytorch.kv_connector.base import KVCachePool, KVCacheValue, KVConnectorOutput, RequestId
 from lmdeploy.utils import get_logger
 
 from .data import (
@@ -19,6 +19,7 @@ from .data import (
     MooncakeStoreConnectorMetadata,
     MooncakeStoreKeyMetadata,
     MooncakeStoreRegistration,
+    MooncakeStoreStateRegistration,
     build_store_key,
 )
 from .lookup import LookupKeyServer
@@ -81,8 +82,6 @@ class MooncakeStoreWorker:
             raise ValueError('tp_size must be greater than 0')
         if tp_rank < 0 or tp_rank >= tp_size:
             raise ValueError(f'tp_rank must be in [0, {tp_size}), got {tp_rank}')
-        if cache_config.states_shapes:
-            raise ValueError('Mooncake Store does not support linear-attention state caches')
         if cache_config.window_size > 1:
             raise ValueError('Mooncake Store does not support sliding-window KV caches')
 
@@ -96,6 +95,7 @@ class MooncakeStoreWorker:
         self.kv_send_thread: KVCacheStoreSendingThread | None = None
         self._registered_regions: tuple[MooncakeStoreRegistration, ...] | None = None
         self._row_block_sizes: tuple[int, ...] | None = None
+        self._registered_state_regions: tuple[MooncakeStoreStateRegistration, ...] = ()
         self._replicate_config = replicate_config
         self._completion_lock = threading.Lock()
         self._inflight_loads: set[RequestId] = set()
@@ -305,6 +305,44 @@ class MooncakeStoreWorker:
             backing_storages.add(int(row.untyped_storage().data_ptr()))
         return tuple(registrations), len(backing_storages)
 
+    @staticmethod
+    def _build_state_registrations(
+        state_cache_pools: Sequence[KVCachePool],
+    ) -> tuple[tuple[MooncakeStoreStateRegistration, ...], int]:
+        registrations = []
+        backing_storages = set()
+        for index, pool in enumerate(state_cache_pools):
+            tensor = pool.tensor
+            if not torch.is_tensor(tensor):
+                raise TypeError(f'state cache pool {index} must be a tensor')
+            if not tensor.is_cuda:
+                raise ValueError(f'state cache pool {index} must be a CUDA tensor')
+            if not tensor.is_contiguous():
+                raise ValueError(f'state cache pool {index} must be contiguous')
+            entry_axis = int(pool.entry_axis)
+            if entry_axis < 0 or entry_axis >= tensor.dim():
+                raise ValueError(
+                    f'state cache pool {index} entry_axis {entry_axis} is invalid for a '
+                    f'{tensor.dim()}D tensor')
+            storage = tensor.untyped_storage()
+            storage_address = int(storage.data_ptr())
+            if storage_address in backing_storages:
+                continue
+            slot_count = int(tensor.shape[entry_axis])
+            slot_size = int(tensor.stride(entry_axis)) * int(tensor.element_size())
+            if slot_count <= 0 or slot_size <= 0:
+                raise ValueError(f'state cache pool {index} must contain non-empty slots')
+            registrations.append(
+                MooncakeStoreStateRegistration(
+                    name=f'state_pool.{index}',
+                    address=storage_address,
+                    size=int(storage.nbytes()),
+                    slot_count=slot_count,
+                    slot_size=slot_size,
+                ))
+            backing_storages.add(storage_address)
+        return tuple(registrations), len(backing_storages)
+
     def _register_buffer(
         self,
         registration: MooncakeStoreRegistration,
@@ -341,28 +379,46 @@ class MooncakeStoreWorker:
             raise RuntimeError(
                 f'Mooncake register_buffer failed for {registration.name!r} with return code {ret}')
 
-    def register_kv_caches(self, kv_caches: Mapping[str, KVCacheValue]) -> None:
-        """Register each contiguous physical KV-cache row with Mooncake."""
-        if not kv_caches:
-            raise ValueError('No KV cache rows were provided for Mooncake Store registration')
+    def register_kv_caches(
+        self,
+        kv_caches: Mapping[str, KVCacheValue],
+        *,
+        state_cache_pools: Sequence[KVCachePool] = (),
+    ) -> None:
+        """Register standard KV rows and owning linear-attention pools."""
+        if not kv_caches and not state_cache_pools:
+            raise ValueError(
+                'No KV cache rows or state pools were provided for Mooncake Store registration')
 
-        registrations, backing_storages = self._build_registrations(kv_caches)
-        row_block_sizes = self._prepare_transfer_layout(registrations)
-        total = len(registrations)
+        registrations, backing_storages = (
+            self._build_registrations(kv_caches) if kv_caches else ((), 0))
+        state_registrations, state_backing_storages = self._build_state_registrations(state_cache_pools)
+        row_block_sizes = self._prepare_transfer_layout(registrations) if registrations else ()
+        total = len(registrations) + len(state_registrations)
         total_bytes = sum(registration.size for registration in registrations)
+        total_bytes += sum(registration.size for registration in state_registrations)
         for index, registration in enumerate(registrations, start=1):
             self._register_buffer(registration, index, total)
+        for index, registration in enumerate(state_registrations, start=len(registrations) + 1):
+            self._register_buffer(
+                MooncakeStoreRegistration(registration.name, registration.address, registration.size),
+                index,
+                total,
+            )
         self._registered_regions = registrations
         self._row_block_sizes = row_block_sizes
-        self._start_receiver()
-        self._start_sender()
+        self._registered_state_regions = state_registrations
+        if registrations:
+            self._start_receiver()
+            self._start_sender()
         self._start_lookup_server()
         logger.debug(
             'Mooncake KV cache registration complete: global_rank=%d tp_rank=%d tp_size=%d '
-            'backing_storages=%d registered_regions=%d bytes=%d',
+            'backing_storages=%d registered_regions=%d state_regions=%d bytes=%d',
             *self._rank_fields(),
-            backing_storages,
+            backing_storages + state_backing_storages,
             total,
+            len(state_registrations),
             total_bytes,
         )
 

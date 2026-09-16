@@ -7,7 +7,7 @@ import torch
 
 from lmdeploy.messages import KVTransferConfig
 from lmdeploy.pytorch.config import CacheConfig
-from lmdeploy.pytorch.kv_connector import KVConnectorOutput
+from lmdeploy.pytorch.kv_connector import KVCachePool, KVConnectorOutput
 from lmdeploy.pytorch.kv_connector.mooncake.store import worker as worker_module
 from lmdeploy.pytorch.kv_connector.mooncake.store import worker_threads as worker_threads_module
 from lmdeploy.pytorch.kv_connector.mooncake.store.data import (
@@ -18,6 +18,7 @@ from lmdeploy.pytorch.kv_connector.mooncake.store.data import (
     MooncakeStoreKeyMetadata,
     MooncakeStoreLoadRequest,
     MooncakeStoreSaveRequest,
+    MooncakeStoreStateRegistration,
     build_prefix_block_hashes,
     build_store_key,
 )
@@ -136,14 +137,18 @@ class FakeTensor:
     def numel(self):
         return self._size
 
+    def dim(self):
+        return len(self.shape)
+
     def element_size(self):
         return 1
 
     def data_ptr(self):
         return self._address
 
-    def stride(self):
-        return (1, )
+    def stride(self, dim=None):
+        strides = (1, )
+        return strides if dim is None else strides[dim]
 
     def untyped_storage(self):
         return FakeStorage(self._storage_address, self._storage_size)
@@ -606,6 +611,42 @@ def test_register_failure_propagates_without_cleanup(tmp_path):
     assert len(store.register_calls) == 3
     assert store.close_calls == 0
     assert worker.store is store
+
+
+def test_registers_state_pools_as_whole_storages_without_block_alignment(tmp_path):
+    path = write_store_config(tmp_path)
+    store = FakeStore()
+    worker = MooncakeStoreWorker(
+        make_cache_config(path, num_gpu_blocks=4, role='kv_producer'),
+        global_rank=0,
+        tp_rank=0,
+        tp_size=1,
+        store_factory=lambda: store,
+    )
+    state_pool = KVCachePool(
+        FakeTensor(0x2000, size=7, storage_address=0x3000, storage_size=11),
+        entry_axis=0,
+    )
+    duplicate_state_pool = KVCachePool(
+        FakeTensor(0x2100, size=5, storage_address=0x3000, storage_size=11),
+        entry_axis=0,
+    )
+
+    worker.register_kv_caches(
+        {'row': FakeTensor(0x1000, size=8)},
+        state_cache_pools=(state_pool, duplicate_state_pool),
+    )
+
+    assert store.register_calls == [(0x1000, 8), (0x3000, 11)]
+    assert worker._registered_state_regions == (
+        MooncakeStoreStateRegistration(
+            name='state_pool.0',
+            address=0x3000,
+            size=11,
+            slot_count=7,
+            slot_size=1,
+        ), )
+    worker.shutdown()
 
 
 def test_register_exception_propagates_without_cleanup(tmp_path):
