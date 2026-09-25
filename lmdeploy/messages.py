@@ -499,6 +499,12 @@ class PytorchEngineConfig:
             but use more checkpoint memory and copy work; larger values reduce
             overhead but make decode-prefix hits less likely. Positive values
             must be multiples of the cache block size.
+        mooncake_prefill_save_alignment: Token alignment for hybrid Mooncake
+            prefill saves. Defaults to 8192 and must be a positive multiple
+            of block_size. Intermediate aligned positions may be skipped.
+        mooncake_state_save_slots: Number of temporary hybrid state snapshots
+            reserved for asynchronous Mooncake saves. Defaults to 8. A full
+            snapshot pool skips the save without blocking inference.
         device_type: The inference device type, options ['cuda']
         eager_mode: Enable "eager" mode or not
         custom_module_map: nn module map customized by users. Once
@@ -565,6 +571,8 @@ class PytorchEngineConfig:
     enable_prefix_caching: bool = False
     prefix_cache_state_budget: int = 0
     prefix_cache_decode_state_interval: int = 0
+    mooncake_prefill_save_alignment: int = 8192
+    mooncake_state_save_slots: int = 8
     device_type: str = 'cuda'
     eager_mode: bool = False
     custom_module_map: dict[str, str] = None
@@ -615,6 +623,8 @@ class PytorchEngineConfig:
         assert self.num_gpu_blocks >= 0, 'invalid num_gpu_blocks'
         assert self.prefix_cache_state_budget >= 0, 'invalid prefix_cache_state_budget'
         assert self.prefix_cache_decode_state_interval >= 0, 'invalid prefix_cache_decode_state_interval'
+        assert self.mooncake_prefill_save_alignment > 0, 'invalid mooncake_prefill_save_alignment'
+        assert self.mooncake_state_save_slots > 0, 'invalid mooncake_state_save_slots'
         try:
             self.quant_policy = QuantPolicy(self.quant_policy)
         except ValueError as e:

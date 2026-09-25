@@ -1,12 +1,17 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import ctypes
 import json
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from lmdeploy.messages import KVTransferConfig
 from lmdeploy.pytorch.config import CacheConfig
+from lmdeploy.pytorch.engine.cache_engine import StateCacheEngine
+from lmdeploy.pytorch.engine.cache_inputs import CacheCheckpointInputs
+from lmdeploy.pytorch.engine.model_agent.agent import _save_cache_checkpoint
 from lmdeploy.pytorch.kv_connector import KVCachePool, KVConnectorOutput
 from lmdeploy.pytorch.kv_connector.mooncake.store import worker as worker_module
 from lmdeploy.pytorch.kv_connector.mooncake.store import worker_threads as worker_threads_module
@@ -17,8 +22,10 @@ from lmdeploy.pytorch.kv_connector.mooncake.store.data import (
     MooncakeStoreConnectorMetadata,
     MooncakeStoreKeyMetadata,
     MooncakeStoreLoadRequest,
+    MooncakeStoreRegistration,
     MooncakeStoreSaveRequest,
     MooncakeStoreStateRegistration,
+    MooncakeStoreStateSave,
     build_prefix_block_hashes,
     build_store_key,
 )
@@ -763,6 +770,87 @@ def test_async_load_writes_target_and_mtp_cache_rows(tmp_path, monkeypatch):
         [[100, 200, 150, 250], [100, 200, 150, 250]],
     )]
     worker.shutdown()
+
+
+@pytest.mark.parametrize('fa_exists', [False, True])
+def test_hybrid_save_keeps_group_zero_format_and_writes_every_state_rank(monkeypatch, fa_exists):
+    metadata = MooncakeStoreKeyMetadata('model', 'prefix', 8, 64, kv_head_replica_num=4)
+    hashes = build_prefix_block_hashes(range(512), 64)
+    request = MooncakeStoreSaveRequest(1, 2, 0, tuple(range(8)), tuple(range(8)), hashes,
+                                      state=MooncakeStoreStateSave(1, 3, 512))
+    written = []
+    for rank in range(8):
+        store = FakeStore()
+        completed = []
+        sender = worker_threads_module.KVCacheStoreSendingThread(
+            store=store, registrations=(MooncakeStoreRegistration('fa', 0x1000, 512),),
+            row_block_sizes=(64,), num_gpu_blocks=8, key_metadata=metadata, global_rank=rank, tp_rank=rank,
+            tp_size=8, completion_callback=completed.append, replicate_config=object(),
+            state_registrations=(MooncakeStoreStateRegistration('state', 0x2000, 64, 4, 16),))
+        state_key = f'prefix@model@tp_rank:{rank}@group:1@{hashes[-1].hex()}'
+        entries = sender._owned_entries(request)
+        # Exercise both orders: a state entry need not follow the FA entries.
+        if rank % 2:
+            entries.reverse()
+        monkeypatch.setattr(sender, '_owned_entries', lambda request, entries=entries: entries)
+        store.lookup_results = [0 if entry.key == state_key else int(fa_exists) for entry in entries]
+        sender.start()
+        sender.add_request(request, FakeCudaEvent())
+        sender.close()
+        assert completed == [1]
+        keys, addresses, sizes, _ = store.put_calls[0]
+        state_index = keys.index(state_key)
+        assert addresses[state_index] == [0x2000 + 3 * 16]
+        assert sizes[state_index] == [16]
+        written.extend(keys)
+    expected_states = {build_store_key(metadata, rank, hashes[-1], group_id=1) for rank in range(8)}
+    expected_fa = set() if fa_exists else {
+        f'prefix@model@tp_rank:{rank}@group:0@{block_hash.hex()}' for rank in range(2) for block_hash in hashes}
+    assert len(written) == len(expected_states | expected_fa)
+    assert set(written) == expected_states | expected_fa
+
+
+@pytest.mark.parametrize('put_result', [0, -1])
+def test_hybrid_sender_reads_frozen_snapshot_across_all_pool_rows(put_result):
+    conv = torch.zeros((4, 6), dtype=torch.uint8)
+    recurrent = torch.zeros((2, 4, 5), dtype=torch.uint8)
+    conv[1] = torch.arange(6)
+    recurrent[:, 1] = torch.arange(10).reshape(2, 5) + 10
+    expected = bytes(conv[1].tolist()) + bytes(recurrent[:, 1].flatten().tolist())
+    engine = object.__new__(StateCacheEngine)
+    engine.cache_config = SimpleNamespace(num_state_caches=4)
+    engine._cache_tensors = [conv, recurrent]
+    engine._slot_tensors = ((conv, 0), (recurrent, 1))
+    _save_cache_checkpoint(SimpleNamespace(is_dummy=False),
+                           CacheCheckpointInputs(state_save_plan=((1,), (3,))), None, engine)
+    conv[1].fill_(99)
+    recurrent[:, 1].fill_(99)
+    event = FakeCudaEvent()
+    store = FakeStore(lookup_results=[1, 0], put_results=[put_result])
+    observed = []
+    completed = []
+    sender = worker_threads_module.KVCacheStoreSendingThread(
+        store=store, registrations=(MooncakeStoreRegistration('fa', 0x1000, 64),), row_block_sizes=(64,),
+        num_gpu_blocks=1, key_metadata=MooncakeStoreKeyMetadata('model', '', 1, 64),
+        global_rank=0, tp_rank=0, tp_size=1, completion_callback=completed.append, replicate_config=object(),
+        state_registrations=(
+            MooncakeStoreStateRegistration('conv', conv.data_ptr(), conv.numel(), 4, 6),
+            MooncakeStoreStateRegistration('recurrent', recurrent.data_ptr(), recurrent.numel(), 4, 5)))
+
+    def read_snapshot():
+        _, addresses, sizes, _ = store.put_calls[-1]
+        actual = b''.join(ctypes.string_at(address, size) for address, size in zip(addresses[0], sizes[0]))
+        observed.append((event.synchronize_calls, actual))
+
+    store.put_callback = read_snapshot
+    sender.start()
+    request = MooncakeStoreSaveRequest(0, 0, 0, (0,), (0,), (bytes(32),),
+                                      state=MooncakeStoreStateSave(1, 3, 64))
+    sender.add_request(request, event)
+    sender.close()
+    assert completed == [0]
+    assert observed == [(1, expected)]
+    assert store.put_calls[0][2] == [[6, 5, 5]]
 
 
 def test_async_save_waits_for_forward_and_writes_only_owned_missing_blocks(

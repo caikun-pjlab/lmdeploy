@@ -89,6 +89,7 @@ def build_prefix_block_hashes(
     *,
     extra_identity: bytes | bytearray | memoryview | str = b'',
     previous_hashes: Sequence[bytes] = (),
+    block_extra_identities: Mapping[int, bytes] | None = None,
 ) -> tuple[bytes, ...]:
     """Build stable, prefix-chained hashes for complete token blocks.
 
@@ -155,6 +156,13 @@ def build_prefix_block_hashes(
                     block_struct,
                 ))
         digest.update(encoded_identity)
+        if block_extra_identities and block_index in block_extra_identities:
+            # Text-only hashes retain their existing byte format. Multimodal
+            # blocks add a domain-separated, length-prefixed stable identity.
+            extra = block_extra_identities[block_index]
+            digest.update(b'\x00multimodal-v1\x00')
+            digest.update(struct.pack('>I', len(extra)))
+            digest.update(extra)
         parent_hash = digest.digest()
         block_hashes.append(parent_hash)
     return tuple(block_hashes)
@@ -183,8 +191,10 @@ def build_store_key(
     metadata: MooncakeStoreKeyMetadata,
     kv_head_rank: int,
     block_hash: bytes | bytearray | memoryview,
+    *,
+    group_id: int = 0,
 ) -> str:
-    """Build Mooncake key for one unique KV-head shard."""
+    """Build a group-0 FA shard key or a group-1 attention-rank state key."""
     block_hash = bytes(block_hash)
     if len(block_hash) != MOONCAKE_BLOCK_HASH_BYTES:
         raise ValueError(f'block_hash must contain {MOONCAKE_BLOCK_HASH_BYTES} bytes')
@@ -193,7 +203,7 @@ def build_store_key(
     return (
         f'{prefix}{metadata.model_name}'
         f'@tp_rank:{kv_head_rank}'
-        '@group:0'
+        f'@group:{group_id}'
         f'@{block_hash.hex()}'
     )
 
@@ -363,6 +373,15 @@ class MooncakeStoreLoadRequest:
 
 
 @dataclass(frozen=True)
+class MooncakeStoreStateSave:
+    """An exact prefill state copied into a save-owned snapshot slot."""
+
+    source_slot: int
+    snapshot_slot: int
+    boundary_tokens: int
+
+
+@dataclass(frozen=True)
 class MooncakeStoreSaveRequest:
     """One immutable full-block suffix saved after a model forward."""
 
@@ -372,6 +391,7 @@ class MooncakeStoreSaveRequest:
     block_ids: tuple[int, ...]
     logical_block_ids: tuple[int, ...]
     block_hashes: tuple[bytes, ...]
+    state: MooncakeStoreStateSave | None = None
 
 
 @dataclass(frozen=True)
@@ -380,6 +400,10 @@ class MooncakeStoreConnectorMetadata(KVConnectorMetadata):
 
     load_requests: tuple[MooncakeStoreLoadRequest, ...] = ()
     save_requests: tuple[MooncakeStoreSaveRequest, ...] = ()
+
+    def get_state_save_copies(self) -> tuple[tuple[int, int], ...]:
+        return tuple((request.state.source_slot, request.state.snapshot_slot)
+                     for request in self.save_requests if request.state is not None)
 
     def get_save_block_leases(self) -> tuple[KVSaveBlockLease, ...]:
         return tuple(

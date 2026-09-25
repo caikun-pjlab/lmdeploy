@@ -9,7 +9,7 @@ metadata, dispatches it to the executor, and updates local running state.
 import logging
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -133,6 +133,7 @@ class InputsMakerConfig:
     enable_chunked_prefill: bool = False
     use_mrope: bool = False
     prefill_interval: int = 16
+    mooncake_prefill_save_alignment: int = 0
 
     @staticmethod
     def from_engine(engine: 'Engine'):
@@ -155,6 +156,8 @@ class InputsMakerConfig:
             window_size=cache_config.window_size,
             enable_prefix_caching=cache_config.enable_prefix_caching,
             prefix_cache_decode_state_interval=cache_config.prefix_cache_decode_state_interval,
+            mooncake_prefill_save_alignment=(cache_config.mooncake_prefill_save_alignment
+                                             if cache_config.num_store_state_caches else 0),
             is_ssm=len(cache_config.states_shapes) > 0,
             dp=engine.dist_config.dp,
             enable_chunked_prefill=engine.misc_config.enable_chunked_prefill,
@@ -173,8 +176,9 @@ class LongContextChunker:
     chunked the same way as the no-cache path.
     """
 
-    def __init__(self, max_prefill_token_num: int):
+    def __init__(self, max_prefill_token_num: int, save_alignment: int = 0):
         self.max_prefill_token_num = max_prefill_token_num
+        self.save_alignment = save_alignment
 
         # long prefill seq
         self.clear()
@@ -185,6 +189,10 @@ class LongContextChunker:
 
     def is_long_context(self, seq: 'SchedulerSequence'):
         """Is long context."""
+        if self.save_alignment:
+            plan = plan_long_context_chunk(seq, get_long_context_chunk_limit(seq, self.max_prefill_token_num),
+                                           include_multimodals=False, save_alignment=self.save_alignment)
+            return not plan.is_last_chunk
         return seq.num_token_ids > self.max_prefill_token_num
 
     def set_seq(self, seq: 'SchedulerSequence'):
@@ -204,13 +212,18 @@ class LongContextChunker:
         if seq is None:
             return 0, None
 
-        plan = plan_long_context_chunk(seq, self.max_prefill_num, self.multimodals)
+        plan = plan_long_context_chunk(seq, self.max_prefill_num, self.multimodals,
+                                       save_alignment=self.save_alignment)
         return plan.chunk_size, plan.multimodals
 
     def is_last_chunk(self):
         """Is last chunk."""
         if self.seq is None:
             return True
+        if self.save_alignment:
+            return plan_long_context_chunk(self.seq, self.max_prefill_num, self.multimodals,
+                                           include_multimodals=False,
+                                           save_alignment=self.save_alignment).is_last_chunk
         return self.seq.num_token_ids <= self.max_prefill_num
 
     def clear(self):
@@ -392,16 +405,29 @@ class _ForwardInputsTask:
 
         result = self.result
         connector_token_lens = ()
+        connector_state_ids = ()
         connector_enabled = maker.scheduler.has_kv_connector()
         if (connector_enabled and result.inputs is not None
                 and not result.inputs.is_decoding and not result.inputs.is_dummy):
             connector_token_lens = self._get_connector_token_lens(result.inputs)
+            if connector_token_lens and maker.config.is_ssm:
+                connector_state_ids = tuple(result.inputs.state_offsets.tolist())
         # Build metadata even without model work: a pending load/save still
         # needs executor steps to submit work and poll asynchronous completion.
         result.kv_connector_metadata = self.scheduler.build_connector_meta(
             result.running,
             connector_token_lens=connector_token_lens,
+            connector_state_ids=connector_state_ids,
         )
+        if result.kv_connector_metadata is not None:
+            state_copies = result.kv_connector_metadata.get_state_save_copies()
+            if state_copies:
+                cache_inputs = result.cache_inputs or CacheCheckpointInputs()
+                src, dst = _make_state_checkpoint_copy_plan(state_copies)
+                if cache_inputs.state_save_plan is not None:
+                    prev_src, prev_dst = cache_inputs.state_save_plan
+                    src, dst = prev_src + src, prev_dst + dst
+                result.cache_inputs = replace(cache_inputs, state_save_plan=(src, dst))
         if result.is_empty():
             return None
         return self._build_payload()
@@ -779,7 +805,8 @@ class InputsMakerAsync:
         self.forward_inputs = None
         self.running_seqs: list[SchedulerSequence] = []
         self.to_evict_seqs: list[SchedulerSequence] = []
-        self.long_context_chunker = LongContextChunker(self.config.max_prefill_token_num)
+        self.long_context_chunker = LongContextChunker(self.config.max_prefill_token_num,
+                                                     self.config.mooncake_prefill_save_alignment)
 
     def reset_runtime_state(self):
         """Discard request-local scheduling state after sleep cancels

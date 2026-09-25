@@ -21,6 +21,12 @@ from lmdeploy.pytorch.engine.inputs_maker import (
 )
 from lmdeploy.pytorch.engine.model_agent.agent import BatchedOutputs
 from lmdeploy.pytorch.kv_connector import KVConnectorOutput
+from lmdeploy.pytorch.kv_connector.mooncake.store.data import (
+    MooncakeStoreConnectorMetadata,
+    MooncakeStoreSaveRequest,
+    MooncakeStoreStateSave,
+)
+from lmdeploy.pytorch.long_context import get_long_context_chunk_limit, plan_long_context_chunk
 from lmdeploy.pytorch.messages import MessageStatus, StateCheckpointRestore, StateCheckpointSaveReservation
 from lmdeploy.pytorch.paging.block_trie.checkpoint_lifecycle import CheckpointCopyPlan
 
@@ -79,6 +85,7 @@ class _DummySeq:
         self.num_history_ids = history_ids
         self.num_token_ids = token_ids
         self.history_multimodals = SimpleNamespace(multimodals=all_multimodals)
+        self.history_embeddings = []
         self._input_multimodals = input_multimodals
         self.prefix_cache = SimpleNamespace(match_start_step=match_start_step)
         self.return_logits = False
@@ -203,6 +210,7 @@ class _FakeScheduler:
         self,
         running,
         connector_token_lens=(),
+        connector_state_ids=(),
     ):
         self.connector_meta_calls.append(tuple(connector_token_lens))
         return None
@@ -238,6 +246,65 @@ def _make_inputs_maker_config():
                              window_size=-1,
                              enable_prefix_caching=False,
                              prefix_cache_decode_state_interval=0)
+
+
+@pytest.mark.parametrize(('history', 'end', 'budget', 'span', 'expected'), [
+    (0, 63, 32768, None, 63),
+    (0, 8191, 32768, None, 8191),
+    (0, 8192, 32768, None, 8192),
+    (0, 8193, 32768, None, 8192),
+    (0, 20000, 32768, None, 16384),
+    (16384, 20000, 32768, None, 20000),
+    (0, 20000, 4096, None, 4096),
+    (4096, 20000, 4096, None, 8192),
+    (8191, 9000, 32768, None, 8192),
+    (0, 20000, 32768, (16000, 18000), 8192),
+    (8192, 20000, 32768, (16000, 18000), 20000),
+    (0, 20000, 4096, (0, 17000), 17000),
+])
+def test_mooncake_prefill_uses_last_safe_aligned_boundary(history, end, budget, span, expected):
+    multimodals = {'image': [_DummyMultiModal(*span)]} if span else {}
+    seq = _DummySeq(history, end - history, multimodals, multimodals)
+    chunker = LongContextChunker(budget, save_alignment=8192)
+    plan = plan_long_context_chunk(seq, get_long_context_chunk_limit(seq, budget), save_alignment=8192)
+
+    assert plan.chunk_end == expected
+    assert plan.is_last_chunk == (expected == end)
+    assert chunker.is_long_context(seq) == (expected != end)
+    chunker.set_seq(seq)
+    assert chunker.next_chunk_size()[0] == expected - history
+    assert chunker.is_last_chunk() == plan.is_last_chunk
+    for spans in (plan.multimodals or {}).values():
+        assert all(data.end <= expected for data in spans)
+
+
+@pytest.mark.parametrize('local_copy', [None, ((1,), (3,))])
+def test_store_state_copy_is_attached_to_actual_prefill_without_apc(local_copy):
+    seq = _DummySeq(0, 16, {}, {})
+    maker = _make_policy_maker(seq)
+    maker.config.is_ssm = True
+    maker.long_context_chunker.clear()
+    maker.scheduler = _FakeScheduler([seq])
+    maker.scheduler.kv_connector = object()
+    inputs = _fake_model_inputs()
+    inputs.history_lengths = torch.tensor([0])
+    inputs.seq_length = torch.tensor([16])
+    inputs.state_offsets = torch.tensor([1])
+    maker.create_model_inputs = lambda seqs, is_prefill: inputs
+    maker.create_model_inputs_delta_valid_only = lambda: (None, [], [])
+    maker._prepare_prefill_cache_inputs = lambda seqs: CacheCheckpointInputs(state_save_plan=local_copy)
+    request = MooncakeStoreSaveRequest(7, 0, 0, (2,), (12,), (bytes(32),),
+                                      state=MooncakeStoreStateSave(1, 4, 16))
+
+    def build_meta(running, connector_token_lens, connector_state_ids):
+        assert connector_token_lens == (16,)
+        assert connector_state_ids == (1,)
+        return MooncakeStoreConnectorMetadata(save_requests=(request,))
+
+    maker.scheduler.build_connector_meta = build_meta
+    payload = maker._make_forward_inputs(prefill=True)
+    expected = ((1,), (4,)) if local_copy is None else ((1, 1), (3, 4))
+    assert payload['cache_inputs'].state_save_plan == expected
 
 
 def _fake_model_inputs(is_chunk: bool = False):

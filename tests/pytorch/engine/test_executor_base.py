@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from lmdeploy.messages import PytorchEngineConfig, QuantPolicy
+from lmdeploy.messages import KVTransferConfig, PytorchEngineConfig, QuantPolicy
 from lmdeploy.pytorch.config import CacheConfig, StateCacheSpec
 from lmdeploy.pytorch.configurations.deepseek_v4 import update_cache_config as update_deepseek_v4_cache_config
 from lmdeploy.pytorch.disagg.config import EngineRole
@@ -16,6 +16,62 @@ from lmdeploy.pytorch.engine.executor import ray_executor as ray_executor_module
 from lmdeploy.pytorch.engine.executor.base import ExecutorBase, _WorkerCachePlanSizes
 from lmdeploy.pytorch.engine.executor.ray_executor import RayExecutor
 from lmdeploy.pytorch.engine.executor.uni_executor import UniExecutor
+from lmdeploy.pytorch.paging.state_manager import build_state_manager
+
+
+@pytest.mark.parametrize('slots', [1, 8, 16])
+def test_mooncake_state_budget_is_deployable_and_excluded_from_runtime(slots):
+    from argparse import ArgumentParser
+
+    from lmdeploy.cli.utils import ArgumentHelper
+    parser = ArgumentParser()
+    ArgumentHelper.mooncake_prefill_save_alignment(parser)
+    ArgumentHelper.mooncake_state_save_slots(parser)
+    defaults = parser.parse_args([])
+    assert (defaults.mooncake_prefill_save_alignment, defaults.mooncake_state_save_slots) == (8192, 8)
+    args = parser.parse_args(['--mooncake-state-save-slots', str(slots), '--mooncake-prefill-save-alignment', '4096'])
+    config = ConfigBuilder.build_cache_config(PytorchEngineConfig(
+        max_batch_size=2, prefix_cache_state_budget=1,
+        kv_transfer_config=KVTransferConfig(kv_connector='MooncakeStoreConnector', kv_role='kv_producer'),
+        **vars(args)))
+    config.states_shapes = [((2,), torch.float32)]
+    executor = object.__new__(ExecutorBase)
+    executor.cache_config = config
+    size = executor._get_state_cache_mem()
+    assert config.mooncake_prefill_save_alignment == 4096
+    assert config.num_state_caches == 5 + slots
+    assert size == config.num_state_caches * StateCacheEngine.get_state_slot_nbytes(config.states_shapes)
+    manager = build_state_manager(config)
+    runtime = [manager.allocate_state() for _ in range(3)]
+    checkpoint = manager.allocate_checkpoint_state()
+    assert set(runtime + [checkpoint]) == {1, 2, 3, 4}
+    assert manager.get_num_free() == 0
+
+
+def test_mooncake_rejects_unsupported_hybrid_configuration():
+    transfer = KVTransferConfig(kv_connector='MooncakeStoreConnector', kv_role='kv_producer')
+    with pytest.raises(ValueError, match='prefix_cache_decode_state_interval'):
+        ConfigBuilder.build_cache_config(PytorchEngineConfig(
+            max_batch_size=1, kv_transfer_config=transfer, prefix_cache_decode_state_interval=64))
+    for option in ('mooncake_state_save_slots', 'mooncake_prefill_save_alignment'):
+        with pytest.raises(AssertionError, match=option):
+            PytorchEngineConfig(**{option: 0})
+    config = ConfigBuilder.build_cache_config(PytorchEngineConfig(max_batch_size=1, kv_transfer_config=transfer))
+    with pytest.raises(ValueError, match='speculative decoding'):
+        ExecutorBase('', SimpleNamespace(sliding_window=-1, states_shapes=[((2,), torch.float32)]), config,
+                     SimpleNamespace(), SimpleNamespace(dp=1, world_size=1), SimpleNamespace(),
+                     specdecode_config=SimpleNamespace())
+
+
+def test_mooncake_requires_a_conv_backend_that_restores_prefill_state(monkeypatch):
+    from lmdeploy.pytorch.backends.cuda import utils
+
+    monkeypatch.setattr(utils, 'has_tilelang', lambda: False)
+    config = ConfigBuilder.build_cache_config(PytorchEngineConfig(max_batch_size=1, kv_transfer_config=KVTransferConfig(
+        kv_connector='MooncakeStoreConnector', kv_role='kv_producer')))
+    model = SimpleNamespace(sliding_window=-1, states_shapes=[((2,), torch.float32)], is_gated_delta=True)
+    with pytest.raises(RuntimeError, match='requires TileLang'):
+        ExecutorBase('', model, config, SimpleNamespace(), SimpleNamespace(dp=1, world_size=1), SimpleNamespace())
 
 
 class _RecordingExecutor(ExecutorBase):
@@ -24,7 +80,7 @@ class _RecordingExecutor(ExecutorBase):
         super().__init__(
             model_path='',
             model_config=SimpleNamespace(sliding_window=None, states_shapes=None),
-            cache_config=SimpleNamespace(role=EngineRole.Hybrid),
+            cache_config=CacheConfig(max_batches=1, block_size=64, num_cpu_blocks=0, num_gpu_blocks=0),
             backend_config=SimpleNamespace(),
             dist_config=SimpleNamespace(dp=1, world_size=1),
             misc_config=SimpleNamespace(empty_init=empty_init, memdecode_config=None),

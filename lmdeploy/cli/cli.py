@@ -55,6 +55,8 @@ class CLI:
         ArgumentHelper.dllm_block_length(pt_group)
         ArgumentHelper.prefix_cache_state_budget(pt_group)
         ArgumentHelper.prefix_cache_decode_state_interval(pt_group)
+        ArgumentHelper.mooncake_prefill_save_alignment(pt_group)
+        ArgumentHelper.mooncake_state_save_slots(pt_group)
         # common engine args
         dtype_act = ArgumentHelper.dtype(pt_group)
         tp_act = ArgumentHelper.tp(pt_group)

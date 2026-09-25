@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -14,20 +15,29 @@ from lmdeploy.pytorch.engine.logits_process import SamplingInputs
 from lmdeploy.pytorch.kv_connector import (
     KVConnectorOutput,
     KVConnectorResult,
+    KVConnectorRole,
     KVConnectorStepInput,
     KVLoadResult,
 )
 from lmdeploy.pytorch.kv_connector.mooncake.store import scheduler as scheduler_module
-from lmdeploy.pytorch.kv_connector.mooncake.store.data import build_prefix_block_hashes
+from lmdeploy.pytorch.kv_connector.mooncake.store.connector import MooncakeStoreConnector
+from lmdeploy.pytorch.kv_connector.mooncake.store.data import (
+    MooncakeStoreKeyMetadata,
+    build_prefix_block_hashes,
+    build_store_key,
+)
 from lmdeploy.pytorch.kv_connector.mooncake.store.scheduler import MooncakeStoreScheduler
-from lmdeploy.pytorch.messages import SequenceMeta
+from lmdeploy.pytorch.messages import MessageStatus, SequenceMeta
 from lmdeploy.pytorch.model_inputs import ModelInputs
+from lmdeploy.pytorch.multimodal.data_type import MultiModalData
 from lmdeploy.pytorch.paging.scheduler import Scheduler
 from lmdeploy.pytorch.prefix_cache_state import PrefixRecomputeOverlap
 from lmdeploy.pytorch.spec_decode.guided_spec_helper import GuidedSpecHelper
 from lmdeploy.pytorch.spec_decode.spec_agent import SpecModelAgent
+from lmdeploy.pytorch.strategies.ar.sequence import ARSequenceStrategy
 from lmdeploy.pytorch.strategies.ar_spec.model_agent import ARSpecExtraInputs
 from lmdeploy.pytorch.strategies.ar_spec.sequence import ARSpecSequenceStrategy
+from lmdeploy.vl.constants import Modality
 
 
 def _cache_config(role='kv_both'):
@@ -70,18 +80,173 @@ def _connector_step(
     token_lens=(),
     block_ids=(),
     logical_block_ids=(),
+    state_ids=(),
 ):
     return KVConnectorStepInput(
         running=list(running),
         connector_token_lens=tuple(token_lens),
         connector_block_ids=tuple(block_ids),
         connector_logical_block_ids=tuple(logical_block_ids),
+        connector_state_ids=tuple(state_ids),
     )
 
 
 # Keep the name used by the MTP save-boundary tests while sharing the main
 # branch's structured connector-step fixture.
 _scheduler_output = _connector_step
+
+
+def _hybrid_cache_config():
+    return replace(_cache_config('kv_producer'), states_shapes=[((2,), torch.float32)],
+                   num_state_caches=5, mooncake_state_save_slots=2, mooncake_prefill_save_alignment=8)
+
+
+def test_hybrid_save_slots_survive_request_finish_until_job_completion():
+    scheduler = MooncakeStoreScheduler(_hybrid_cache_config())
+    request = _request(range(33))
+    request.is_prefix_cache_boundary_safe = lambda step: True
+
+    def step(end):
+        blocks = tuple(range(end // 4))
+        return scheduler.build_connector_meta(_connector_step(
+            (request,), (end,), (blocks,), (tuple(block + 10 for block in blocks),), (1,)))
+
+    assert step(3) is None
+    assert step(4) is None
+    first = step(8).save_requests[0]
+    second = step(16).save_requests[0]
+    assert (first.state.snapshot_slot, second.state.snapshot_slot) == (3, 4)
+    assert first.state.boundary_tokens == 8
+    assert second.start_block == 2
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert step(24).save_requests == ()
+    assert scheduler._next_save_block[request.seq_id] == 4
+
+    scheduler.update_connector_output(KVConnectorOutput(completed_save_ids={first.save_id}))
+    third = step(24).save_requests[0]
+    assert third.start_block == 4
+    assert third.state.snapshot_slot == first.state.snapshot_slot
+    scheduler.request_finished(request)
+    assert scheduler._state_slots.get_num_free() == 0
+    scheduler.update_connector_output(KVConnectorOutput(completed_save_ids={second.save_id, third.save_id}))
+    assert scheduler._state_slots.get_num_free() == 2
+    assert scheduler.build_connector_meta(_connector_step()) is None
+    # Duplicate completion is harmless; drain is the alternate terminal proof.
+    scheduler.update_connector_output(KVConnectorOutput(completed_save_ids={third.save_id}))
+    assert step(8).save_requests
+    scheduler.finish_transfers_after_worker_drain()
+    assert scheduler._state_slots.get_num_free() == 2
+    scheduler.shutdown()
+
+
+def test_hybrid_multimodal_hashes_work_without_local_prefix_cache():
+    cache_config = _hybrid_cache_config()
+    paging = Scheduler(SchedulerConfig(max_batches=1, max_session_len=64), cache_config,
+                       seq_meta=SequenceMeta(4, strategy=ARSequenceStrategy()))
+    store = MooncakeStoreScheduler(cache_config)
+    hashes = []
+    for request_id, content in enumerate((1, 2, 1)):
+        image = MultiModalData(torch.tensor([content]), start=2, end=10)
+        request = paging.add_session(request_id).add_sequence(range(17), multimodals={'image': [image]})
+        assert request.prefix_cache.multimodal_spans
+        prefix = store._get_request_block_hashes(request, request.seq_id, 12, 4)
+        full = store._get_request_block_hashes(request, request.seq_id, 16, 4)
+        assert prefix == full[:3]
+        fresh = MooncakeStoreScheduler(cache_config)
+        assert fresh._get_request_block_hashes(request, request.seq_id, 16, 4) == full
+        fresh.shutdown()
+        hashes.append(full)
+        # Eight is inside the image. Sixteen has the exact complete state.
+        blocked = _connector_step((request,), (8,), ((0, 1),), ((10, 11),), (1,))
+        assert store.build_connector_meta(blocked) is None
+    assert hashes[0] == hashes[2]
+    assert all(a != b for a, b in zip(hashes[0], hashes[1]))
+    valid = _connector_step((request,), (16,), ((0, 1, 2, 3),), ((10, 11, 12, 13),), (1,))
+    assert store.build_connector_meta(valid).save_requests[0].state.boundary_tokens == 16
+    store.shutdown()
+    paging.shutdown()
+
+
+def test_hybrid_save_alignment_must_be_a_multiple_of_block_size():
+    with pytest.raises(ValueError, match='multiple of block_size'):
+        MooncakeStoreScheduler(replace(_hybrid_cache_config(), mooncake_prefill_save_alignment=6))
+
+
+@pytest.mark.parametrize('modality', [Modality.IMAGE, Modality.VIDEO])
+def test_fa_multimodal_save_hashes_work_without_local_prefix_cache(modality):
+    cache_config = _cache_config('kv_producer')
+    paging = Scheduler(SchedulerConfig(max_batches=1, max_session_len=64), cache_config,
+                       seq_meta=SequenceMeta(4, strategy=ARSequenceStrategy()))
+    store = MooncakeStoreScheduler(cache_config)
+    assert cache_config.needs_prefix_cache_identity
+    assert not paging.block_trie.enabled
+    assert cache_config.num_store_state_caches == 0
+    hashes = []
+    for request_id, content in enumerate((1, 2, 1)):
+        media = MultiModalData(torch.tensor([content]), start=6, end=13, modality=modality)
+        request = paging.add_session(request_id).add_sequence(range(17), multimodals={modality.value: [media]})
+        assert request.prefix_cache.multimodal_spans
+        prefix = store._get_request_block_hashes(request, request.seq_id, 8, 4)
+        metadata = store.build_connector_meta(_connector_step(
+            (request,), (17,), ((0, 1, 2, 3, 4),), ((10, 11, 12, 13, 14),)))
+        save = metadata.save_requests[0]
+        # FA saves complete blocks, including those ending inside the span.
+        # The incomplete tail and hybrid save alignment do not affect them.
+        assert save.block_ids == (0, 1, 2, 3)
+        assert save.state is None
+        assert metadata.get_state_save_copies() == ()
+        assert save.block_hashes[:2] == prefix
+        assert save.block_hashes[0] == build_prefix_block_hashes(range(4), 4)[0]
+        hashes.append(save.block_hashes)
+    assert hashes[0] == hashes[2]
+    assert hashes[0][0] == hashes[1][0]
+    assert all(a != b for a, b in zip(hashes[0][1:], hashes[1][1:]))
+    store.shutdown()
+    paging.shutdown()
+
+
+@pytest.mark.parametrize(('spans', 'remote_hit', 'expected_end'), [
+    (((6, 13),), 12, 4),
+    (((6, 13),), 16, 16),
+    (((8, 12),), 8, 8),
+    (((8, 12),), 12, 12),
+    (((2, 7), (7, 13)), 12, 0),
+])
+def test_fa_multimodal_lookup_load_restores_only_safe_boundaries(spans, remote_hit, expected_end):
+    config = _cache_config('kv_consumer')
+    connector = MooncakeStoreConnector(KVConnectorRole.SCHEDULER, config)
+    consumer = connector.connector_scheduler
+    paging = Scheduler(SchedulerConfig(max_batches=1, max_session_len=64), config,
+                       seq_meta=SequenceMeta(4, strategy=ARSequenceStrategy()), kv_connector=connector)
+    media = [MultiModalData(torch.tensor([1]), start=start, end=end) for start, end in spans]
+    request = paging.add_session(0).add_sequence(range(17), multimodals={'image': media})
+    producer = MooncakeStoreScheduler(_cache_config('kv_producer'))
+    save = producer.build_connector_meta(_connector_step(
+        (request,), (17,), ((0, 1, 2, 3, 4),), ((10, 11, 12, 13, 14),))).save_requests[0]
+    consumer.client.lookup = Mock(return_value=remote_hit)
+
+    result = paging.schedule(is_prefill=True)
+    consumer.client.lookup.assert_called_once_with(request.seq_id, 16, save.block_hashes, non_block=True)
+    assert not paging.block_trie.enabled
+    metadata = paging.build_connector_meta([])
+    if expected_end:
+        assert result.running == []
+        assert request.status == MessageStatus.WAITING_FOR_REMOTE_KVS
+        load = metadata.load_requests[0]
+        assert load.remote_block_count == expected_end // 4
+        assert len(load.block_ids) == expected_end // 4
+        assert load.block_hashes == save.block_hashes[:expected_end // 4]
+        paging.update_connector_output(KVConnectorOutput(finished_receiving={request.seq_id}))
+        assert request.status == MessageStatus.WAITING
+    else:
+        assert result.running == [request]
+        assert metadata is None
+    assert request.num_history_ids == expected_end
+    assert request.is_prefix_cache_boundary_safe(request.num_history_ids)
+    remaining = request.get_input_multimodals().get('image', [])
+    assert [(data.start, data.end) for data in remaining] == [span for span in spans if span[0] >= expected_end]
+    producer.shutdown()
+    paging.shutdown()
 
 
 def test_prefix_block_hashes_are_stable_chained_and_incremental():
@@ -106,6 +271,9 @@ def test_prefix_block_hashes_are_stable_chained_and_incremental():
     assert extended == full
     assert build_prefix_block_hashes(tokens[:12], 4, extra_identity='adapter-a') == full
     assert build_prefix_block_hashes(tokens, 4, extra_identity='adapter-b') != full
+    metadata = MooncakeStoreKeyMetadata('model', 'prefix', 1, 4)
+    assert tuple(build_store_key(metadata, 0, block_hash) for block_hash in full) == tuple(
+        f'prefix@model@tp_rank:0@group:0@{block_hash}' for block_hash in expected)
 
 
 def test_scheduler_extends_hashes_and_reports_pending_miss_and_hit(monkeypatch):
@@ -226,11 +394,11 @@ def test_spec_external_lookup_drops_last_actual_hit_block(remote_hit, local_hit,
     ('role', 'multimodal', 'embeddings'),
     [
         ('kv_producer', False, False),
-        ('kv_both', True, False),
+        ('kv_both', True, True),
         ('kv_both', False, True),
     ],
 )
-def test_scheduler_filters_non_consumers_and_non_text_requests(
+def test_scheduler_filters_non_consumers_and_direct_embeddings(
     role,
     multimodal,
     embeddings,
@@ -548,7 +716,7 @@ def test_worker_drain_discards_save_ids_whose_outputs_were_dropped():
     scheduler.shutdown()
 
 
-def test_successful_remote_load_is_not_saved_back_and_save_filters_non_text():
+def test_successful_remote_load_is_not_saved_back_and_save_filters_direct_embeddings():
     scheduler = MooncakeStoreScheduler(_cache_config())
     request = _request(range(17))
     scheduler.client.lookup = Mock(return_value=12)
@@ -568,10 +736,10 @@ def test_successful_remote_load_is_not_saved_back_and_save_filters_non_text():
         ))
     assert no_resave is None
 
-    multimodal = _request(range(17), multimodal=True)
+    embeddings = _request(range(17), embeddings=True)
     assert scheduler.build_connector_meta(
         _connector_step(
-            running=(multimodal, ),
+            running=(embeddings, ),
             token_lens=(16, ),
             block_ids=((1, 2, 3, 4), ),
             logical_block_ids=((11, 12, 13, 14), ),

@@ -209,6 +209,7 @@ class MooncakeStoreWorker:
             tp_size=self.tp_size,
             completion_callback=self._mark_save_finished,
             replicate_config=self._replicate_config,
+            state_registrations=self._registered_state_regions,
         )
         sender.start()
         self.kv_send_thread = sender

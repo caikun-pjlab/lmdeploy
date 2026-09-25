@@ -47,6 +47,7 @@ class KVConnectorStepInput:
     connector_token_lens: tuple[int, ...] = ()
     connector_block_ids: tuple[tuple[int, ...], ...] = ()
     connector_logical_block_ids: tuple[tuple[int, ...], ...] = ()
+    connector_state_ids: tuple[int, ...] = ()
 
 
 class KVConnectorMetadata(ABC):
@@ -58,6 +59,10 @@ class KVConnectorMetadata(ABC):
 
     def get_save_block_leases(self) -> tuple['KVSaveBlockLease', ...]:
         """Return scheduler-owned block leases required by this step."""
+        return ()
+
+    def get_state_save_copies(self) -> tuple[tuple[int, int], ...]:
+        """Return host (runtime, snapshot) slot pairs copied after forward."""
         return ()
 
 

@@ -81,6 +81,7 @@ class Scheduler:
         self.kv_connector = kv_connector
         seq_meta = seq_meta or SequenceMeta(self.cache_config.block_size)
         seq_meta.enable_prefix_caching = self.cache_config.enable_prefix_caching
+        seq_meta.enable_mooncake_store = cache_config.use_mooncake_store
         self.seq_meta = seq_meta
         self.seq_manager = SequenceManager(seq_meta)
 
@@ -423,6 +424,7 @@ class Scheduler:
         self,
         running: SeqList,
         connector_token_lens: tuple[int, ...] = (),
+        connector_state_ids: tuple[int, ...] = (),
     ):
         """Build and lease one connector payload after work selection.
 
@@ -453,6 +455,7 @@ class Scheduler:
             connector_token_lens=connector_token_lens,
             connector_block_ids=block_ids,
             connector_logical_block_ids=logical_block_ids,
+            connector_state_ids=connector_state_ids,
         )
         metadata = connector.build_connector_meta(step_input)
         if metadata is not None:

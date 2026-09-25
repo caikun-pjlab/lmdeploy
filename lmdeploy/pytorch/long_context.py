@@ -32,7 +32,7 @@ class LongContextChunkPlan:
             is clamped back to the span start.
         chunk_size: Number of tokens to send in the next forward,
             ``chunk_end - chunk_start``.
-        is_last_chunk: Whether the remaining suffix fits in ``chunk_limit``.
+        is_last_chunk: Whether this chunk reaches the end of the prefill.
             Last chunks are handled as normal prefill so they can merge into
             persistent decode state.
         multimodals: Remaining multimodal payloads wholly contained in this
@@ -84,24 +84,21 @@ def get_long_context_chunk_limit(seq: 'SchedulerSequence', max_prefill_token_num
 def plan_long_context_chunk(seq: 'SchedulerSequence',
                             chunk_limit: int,
                             multimodals: 'MultiModalInputs|None' = None,
-                            include_multimodals: bool = True) -> LongContextChunkPlan:
-    """Plan the next chunk without splitting multimodal spans."""
+                            include_multimodals: bool = True,
+                            save_alignment: int = 0) -> LongContextChunkPlan:
+    """Plan a model-safe chunk, optionally stopping at its last save boundary.
+
+    Alignment is a constraint, not a sampling interval: earlier aligned positions in this chunk are skipped. If no safe
+    aligned position advances the request, use the ordinary chunk and keep only its running state.
+    """
     chunk_size = min(seq.num_token_ids, chunk_limit)
     start = seq.num_history_ids
     end = start + chunk_size
 
     if multimodals is None:
         multimodals = seq.get_input_multimodals()
-    if len(multimodals) == 0:
-        return LongContextChunkPlan(chunk_limit=chunk_limit,
-                                    chunk_start=start,
-                                    chunk_end=end,
-                                    chunk_size=chunk_size,
-                                    is_last_chunk=seq.num_token_ids <= chunk_limit,
-                                    multimodals=None)
-
-    out_multimodals = defaultdict(list)
-    for modal_type, data in _iter_sorted_multimodals(multimodals):
+    spans = list(_iter_sorted_multimodals(multimodals))
+    for _, data in spans:
         assert data.start >= start, 'multimodal data should be sorted by start'
         if data.start >= end:
             break
@@ -110,15 +107,26 @@ def plan_long_context_chunk(seq: 'SchedulerSequence',
             # next chunk instead.
             end = data.start
             break
-        if include_multimodals:
-            out_multimodals[modal_type].append(data)
+
+    # Embedding-only inputs do not yet have a Store content identity.
+    if save_alignment and len(seq.history_embeddings) == 0:
+        save_end = end // save_alignment * save_alignment
+        for _, data in reversed(spans):
+            if data.start < save_end < data.end:
+                save_end = data.start // save_alignment * save_alignment
+        if save_end > start:
+            end = save_end
 
     chunk_size = end - start
-    if not include_multimodals:
-        out_multimodals = None
+    out_multimodals = None
+    if include_multimodals and spans:
+        out_multimodals = defaultdict(list)
+        for modal_type, data in spans:
+            if data.end <= end:
+                out_multimodals[modal_type].append(data)
     return LongContextChunkPlan(chunk_limit=chunk_limit,
                                 chunk_start=start,
                                 chunk_end=end,
                                 chunk_size=chunk_size,
-                                is_last_chunk=seq.num_token_ids <= chunk_limit,
+                                is_last_chunk=chunk_size == seq.num_token_ids,
                                 multimodals=out_multimodals)

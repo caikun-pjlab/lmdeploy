@@ -8,7 +8,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from lmdeploy.pytorch.kv_connector.base import RequestId
 from lmdeploy.utils import get_logger
@@ -18,6 +18,7 @@ from .data import (
     MooncakeStoreLoadRequest,
     MooncakeStoreRegistration,
     MooncakeStoreSaveRequest,
+    MooncakeStoreStateRegistration,
     build_store_key,
 )
 
@@ -35,6 +36,15 @@ class _SaveTask:
     request: MooncakeStoreSaveRequest
     ready_event: Any
     enqueue_time: float
+
+
+@dataclass(frozen=True)
+class _SaveEntry:
+    """A Store key bound to a physical FA block or linear-state snapshot."""
+
+    key: str
+    cache_kind: Literal['full_attention', 'linear_attention']
+    source_index: int
 
 
 def _scatter_block(
@@ -87,6 +97,7 @@ class KVCacheStoreSendingThread(threading.Thread):
         tp_size: int,
         completion_callback: Callable[[int], None],
         replicate_config: Any = None,
+        state_registrations: tuple[MooncakeStoreStateRegistration, ...] = (),
     ) -> None:
         super().__init__(name='MooncakeKVCacheStoreSender', daemon=True)
         if not registrations or len(registrations) != len(row_block_sizes):
@@ -108,6 +119,18 @@ class KVCacheStoreSendingThread(threading.Thread):
         self.replica_rank = tp_rank % key_metadata.kv_head_replica_num
         self.completion_callback = completion_callback
         self.replicate_config = replicate_config
+        # A packed pool has one row of slots. A layer-major pool has one
+        # such row per layer; each row is inside the already registered pool.
+        self.state_rows = tuple(
+            MooncakeStoreRegistration(region.name,
+                                     region.address + row * region.slot_count * region.slot_size,
+                                     region.slot_count * region.slot_size)
+            for region in state_registrations
+            for row in range(region.size // (region.slot_count * region.slot_size))
+        )
+        self.state_slot_sizes = tuple(region.slot_size for region in state_registrations
+                                      for _ in range(region.size // (region.slot_count * region.slot_size)))
+        self.num_state_slots = state_registrations[0].slot_count if state_registrations else 0
         self.request_queue: queue.Queue[_SaveTask | object] = queue.Queue()
         self._state_lock = threading.Lock()
         self._closed = False
@@ -129,34 +152,46 @@ class KVCacheStoreSendingThread(threading.Thread):
                 ))
         logger.debug(
             'Mooncake KV save enqueued: global_rank=%d tp_rank=%d tp_size=%d '
-            'save_id=%d request_id=%s blocks=%d',
+            'save_id=%d request_id=%s blocks=%d state_boundary=%s state_bytes=%d',
             self.global_rank,
             self.tp_rank,
             self.tp_size,
             request.save_id,
             request.request_id,
             len(request.block_ids),
+            request.state.boundary_tokens if request.state is not None else None,
+            sum(self.state_slot_sizes) if request.state is not None else 0,
         )
 
     def _owned_entries(
         self,
         request: MooncakeStoreSaveRequest,
-    ) -> tuple[list[str], list[int]]:
+    ) -> list[_SaveEntry]:
         if not (len(request.block_ids) == len(request.block_hashes)
                 == len(request.logical_block_ids)):
             raise ValueError('Mooncake save request block fields must have equal lengths')
 
         replica_num = self.key_metadata.kv_head_replica_num
-        keys = []
-        block_ids = []
+        entries = []
         for suffix_index, (block_id, block_hash) in enumerate(
                 zip(request.block_ids, request.block_hashes, strict=True)):
             absolute_block = request.start_block + suffix_index
             if absolute_block % replica_num != self.replica_rank:
                 continue
-            keys.append(build_store_key(self.key_metadata, self.key_rank, block_hash))
-            block_ids.append(block_id)
-        return keys, block_ids
+            entries.append(_SaveEntry(
+                key=build_store_key(self.key_metadata, self.key_rank, block_hash),
+                cache_kind='full_attention',
+                source_index=block_id,
+            ))
+        if request.state is not None:
+            # State uses every attention TP rank. It must not inherit FA's
+            # replicated-KV-head ownership rule.
+            entries.append(_SaveEntry(
+                key=build_store_key(self.key_metadata, self.tp_rank, request.block_hashes[-1], group_id=1),
+                cache_kind='linear_attention',
+                source_index=request.state.snapshot_slot,
+            ))
+        return entries
 
     def _find_missing(self, request: MooncakeStoreSaveRequest, keys: list[str]) -> list[int]:
         logger.debug(
@@ -213,20 +248,20 @@ class KVCacheStoreSendingThread(threading.Thread):
     def _put_missing(
         self,
         request: MooncakeStoreSaveRequest,
-        keys: list[str],
-        block_ids: list[int],
+        entries: list[_SaveEntry],
         missing: list[int],
     ) -> bool:
-        missing_keys = [keys[index] for index in missing]
+        missing_entries = [entries[index] for index in missing]
+        missing_keys = [entry.key for entry in missing_entries]
         addresses = []
         sizes = []
-        for index in missing:
-            block_addresses, block_sizes = _scatter_block(
-                self.registrations,
-                self.row_block_sizes,
-                self.num_gpu_blocks,
-                block_ids[index],
-            )
+        for entry in missing_entries:
+            if entry.cache_kind == 'full_attention':
+                block_addresses, block_sizes = _scatter_block(
+                    self.registrations, self.row_block_sizes, self.num_gpu_blocks, entry.source_index)
+            else:
+                block_addresses, block_sizes = _scatter_block(
+                    self.state_rows, self.state_slot_sizes, self.num_state_slots, entry.source_index)
             addresses.append(block_addresses)
             sizes.append(block_sizes)
 
@@ -234,14 +269,14 @@ class KVCacheStoreSendingThread(threading.Thread):
         logger.debug(
             'Mooncake Store interaction before: operation=save_batch_put_from_multi_buffers '
             'global_rank=%d tp_rank=%d tp_size=%d save_id=%d request_id=%s '
-            'keys=%d fragments_per_key=%d bytes=%d',
+            'keys=%d fragments=%d bytes=%d',
             self.global_rank,
             self.tp_rank,
             self.tp_size,
             request.save_id,
             request.request_id,
             len(missing_keys),
-            len(self.registrations),
+            sum(len(parts) for parts in addresses),
             total_bytes,
         )
         start = time.perf_counter()
@@ -301,7 +336,8 @@ class KVCacheStoreSendingThread(threading.Thread):
 
     def _save(self, task: _SaveTask) -> bool:
         request = task.request
-        keys, block_ids = self._owned_entries(request)
+        entries = self._owned_entries(request)
+        keys = [entry.key for entry in entries]
         missing = None
         try:
             missing = self._find_missing(request, keys) if keys else []
@@ -314,7 +350,7 @@ class KVCacheStoreSendingThread(threading.Thread):
         # direct GPU read must wait until all preceding compute-stream writes
         # are visible.
         if missing:
-            return self._put_missing(request, keys, block_ids, missing)
+            return self._put_missing(request, entries, missing)
         return True
 
     def run(self) -> None:
