@@ -215,13 +215,13 @@ class MooncakeStoreWorker:
         self.kv_send_thread = sender
 
     def _create_store(self, store_factory: StoreFactory) -> Any:
-        logger.warning(
+        logger.debug(
             'Mooncake Store interaction before: operation=create global_rank=%d tp_rank=%d tp_size=%d',
             *self._rank_fields(),
         )
         start = time.perf_counter()
         store = store_factory()
-        logger.warning(
+        logger.debug(
             'Mooncake Store interaction after: operation=create global_rank=%d tp_rank=%d tp_size=%d '
             'status=ok elapsed_ms=%.3f',
             *self._rank_fields(),
@@ -231,7 +231,7 @@ class MooncakeStoreWorker:
 
     def _setup_store(self, store: Any, local_hostname: str) -> None:
         config = self.store_config
-        logger.warning(
+        logger.debug(
             'Mooncake Store interaction before: operation=setup global_rank=%d tp_rank=%d tp_size=%d '
             'local_hostname=%s metadata_server=%s global_segment_size=%d local_buffer_size=%d protocol=%s '
             'device_name=%s master_server_address=%s',
@@ -256,7 +256,7 @@ class MooncakeStoreWorker:
         )
 
         status = 'ok' if ret == 0 else 'error'
-        log = logger.warning if ret == 0 else logger.error
+        log = logger.debug if ret == 0 else logger.error
         log(
             'Mooncake Store interaction after: operation=setup global_rank=%d tp_rank=%d tp_size=%d '
             'status=%s elapsed_ms=%.3f ret=%s',
@@ -350,7 +350,7 @@ class MooncakeStoreWorker:
         index: int,
         total: int,
     ) -> None:
-        logger.warning(
+        logger.debug(
             'Mooncake Store interaction before: operation=register_buffer global_rank=%d tp_rank=%d tp_size=%d '
             'index=%d/%d name=%s addr=%#x bytes=%d',
             *self._rank_fields(),
@@ -364,7 +364,7 @@ class MooncakeStoreWorker:
         ret = self.store.register_buffer(registration.address, registration.size)
 
         status = 'ok' if ret == 0 else 'error'
-        log = logger.warning if ret == 0 else logger.error
+        log = logger.debug if ret == 0 else logger.error
         log(
             'Mooncake Store interaction after: operation=register_buffer global_rank=%d tp_rank=%d tp_size=%d '
             'index=%d/%d name=%s status=%s elapsed_ms=%.3f ret=%s',
@@ -413,7 +413,7 @@ class MooncakeStoreWorker:
             self._start_receiver()
             self._start_sender()
         self._start_lookup_server()
-        logger.warning(
+        logger.debug(
             'Mooncake KV cache registration complete: global_rank=%d tp_rank=%d tp_size=%d '
             'backing_storages=%d registered_regions=%d state_regions=%d bytes=%d',
             *self._rank_fields(),
@@ -493,7 +493,7 @@ class MooncakeStoreWorker:
             for block_index in range(full_blocks)
             for rank in range(unique_kv_ranks)
         ]
-        logger.warning(
+        logger.debug(
             'Mooncake Store interaction before: operation=lookup_batch_is_exist '
             'global_rank=%d tp_rank=%d tp_size=%d token_len=%d blocks=%d candidate_keys=%d',
             *self._rank_fields(),
@@ -531,7 +531,7 @@ class MooncakeStoreWorker:
                 break
             matched_blocks += 1
         matched_tokens = matched_blocks * key_metadata.block_size
-        logger.warning(
+        logger.debug(
             'Mooncake Store interaction after: operation=lookup_batch_is_exist '
             'global_rank=%d tp_rank=%d tp_size=%d token_len=%d blocks=%d candidate_keys=%d '
             'status=ok matched_blocks=%d matched_tokens=%d elapsed_ms=%.3f',
@@ -568,14 +568,14 @@ class MooncakeStoreWorker:
             self._close_store(store)
 
     def _close_store(self, store: Any) -> None:
-        logger.warning(
+        logger.debug(
             'Mooncake Store interaction before: operation=close global_rank=%d tp_rank=%d tp_size=%d',
             *self._rank_fields(),
         )
         start = time.perf_counter()
         ret = store.close()
         status = 'ok' if ret in (None, 0) else 'error'
-        log = logger.warning if status == 'ok' else logger.warning
+        log = logger.debug if status == 'ok' else logger.warning
         log(
             'Mooncake Store interaction after: operation=close global_rank=%d tp_rank=%d tp_size=%d '
             'status=%s elapsed_ms=%.3f ret=%s',
