@@ -303,7 +303,7 @@ class MooncakeStoreScheduler:
                     raise ValueError('hybrid saves require an allocated runtime state slot')
                 if self._state_slots.get_num_free() == 0:
                     self._num_skipped_state_saves += 1
-                    logger.debug('Mooncake state save skipped: request_id=%s boundary=%d slots=%d skipped=%d',
+                    logger.info('Mooncake state save skipped: request_id=%s boundary=%d slots=%d skipped=%d',
                                  request_id, token_len, self._state_slots.num_states, self._num_skipped_state_saves)
                     continue
             if full_blocks > len(request_blocks) or full_blocks > len(request_logical_blocks):
